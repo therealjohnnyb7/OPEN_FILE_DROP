@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0c0f14" />
+  <meta name="description" content="Shared inbox — upload on PC, grab on phone. Files expire in 24 hours." />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <title>Drop · Shared Inbox</title>
+  <link rel="stylesheet" href="/styles.css?v=8" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>" />
+</head>
+<body>
+  <div class="shell">
+    <header class="top">
+      <a class="brand" href="/">
+        <span class="brand-mark">📦</span>
+        <span class="brand-name">Drop</span>
+      </a>
+      <p class="tagline" id="tagline">Same page on every device · files gone in 24 hours</p>
+      <p id="statusLine" class="status-line">Connecting…</p>
+      <figure class="qr-card" aria-label="QR code for this page">
+        <div class="qr-plate">
+          <img
+            id="qrImg"
+            src="/qr.svg"
+            width="160"
+            height="160"
+            alt="QR code — scan with your phone to open this page"
+          />
+        </div>
+        <figcaption class="qr-caption">Point your phone at this</figcaption>
+      </figure>
+    </header>
+
+    <main>
+      <section id="dropzone" class="dropzone compact" tabindex="0" role="button" aria-label="Upload files">
+        <input type="file" id="fileInput" class="sr-only" multiple accept="*/*" />
+        <div class="dropzone-inner">
+          <div class="icon-ring sm" aria-hidden="true">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 16V4"/>
+              <path d="M7 9l5-5 5 5"/>
+              <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+            </svg>
+          </div>
+          <h1>Add files</h1>
+          <p class="muted" id="dropHint">Photos, videos, anything · max 100&nbsp;MB</p>
+          <button type="button" class="btn primary" id="browseBtn">Choose files</button>
+        </div>
+      </section>
+
+      <section id="notepad" class="notepad" aria-label="Shared notepad">
+        <div class="notepad-header">
+          <h2>Notepad</h2>
+          <div class="notepad-actions">
+            <button type="button" class="btn ghost sm" id="noteCopy">Copy</button>
+            <button type="button" class="btn ghost sm danger-btn" id="noteClear">Clear</button>
+          </div>
+        </div>
+        <label class="sr-only" for="noteInput">Shared note</label>
+        <textarea
+          id="noteInput"
+          rows="6"
+          maxlength="20000"
+          placeholder="Links, codes, addresses — type here, copy on the other device."
+          spellcheck="true"
+          autocomplete="off"
+          autocapitalize="off"
+        ></textarea>
+        <div class="notepad-foot">
+          <span id="noteStatus" class="note-status">Shared · live on every device</span>
+          <span id="noteCount" class="note-count mono"></span>
+        </div>
+      </section>
+
+      <section id="progressPanel" class="panel hidden" aria-live="polite">
+        <div class="row between">
+          <span id="progressName" class="truncate">Uploading…</span>
+          <span id="progressPct" class="mono">0%</span>
+        </div>
+        <div class="bar"><div id="progressBar" class="bar-fill"></div></div>
+      </section>
+
+      <section id="errorPanel" class="panel error hidden" role="alert">
+        <p id="errorText"></p>
+        <button type="button" class="btn" id="errorDismiss">Dismiss</button>
+      </section>
+
+      <section class="files-section">
+        <div class="files-header">
+          <h2>Files <span id="fileCount" class="count-pill">—</span></h2>
+          <button type="button" class="btn ghost sm" id="refreshBtn" title="Refresh">Refresh</button>
+        </div>
+        <div id="emptyState" class="empty-state">
+          <p id="emptyTitle">Loading files…</p>
+          <p class="muted" id="emptyHint">Pulling the shared inbox.</p>
+        </div>
+        <ul id="fileList" class="file-list" aria-live="polite"></ul>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <p>Photos/videos: tap <strong>Save</strong> → choose Photos on your phone.</p>
+      <p class="mono url-line" id="pageUrl"></p>
+    </footer>
+  </div>
+
+  <!-- Fullscreen media viewer -->
+  <div id="viewer" class="viewer hidden" role="dialog" aria-modal="true" aria-label="Media viewer">
+    <div class="viewer-bar">
+      <button type="button" class="btn ghost sm" id="viewerClose">Close</button>
+      <span id="viewerTitle" class="viewer-title truncate"></span>
+      <button type="button" class="btn primary sm" id="viewerSave">Save</button>
+    </div>
+    <div class="viewer-body" id="viewerBody"></div>
+    <p class="viewer-hint" id="viewerHint">
+      On iPhone: long-press the image/video → <strong>Add to Photos</strong>, or use Save for the share sheet.
+    </p>
+  </div>
+
+  <script src="/app.js?v=8"></script>
+</body>
+</html>
