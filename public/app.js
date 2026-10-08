@@ -38,6 +38,10 @@
   let hasLoadedOnce = false;
   let loadInFlight = false;
   let filesById = {};
+  let lastListKey = null;
+  // Phone save state: the share sheet needs the whole file in memory first
+  let saveProgress = {}; // id -> percent while downloading
+  let preparedFile = null; // { id, file } kept so a second tap shares instantly
   let activeViewerFile = null;
   let noteDirty = false;
   let noteSaving = false;
@@ -436,17 +440,42 @@
     );
   }
 
+  function saveLabel(f) {
+    if (typeof saveProgress[f.id] === "number") return "Loading " + saveProgress[f.id] + "%";
+    if (preparedFile && preparedFile.id === f.id) return "Tap to save";
+    return "Save to Photos";
+  }
+
+  // Repaint every Save button for this file (list row and viewer)
+  function refreshSaveButtons(id) {
+    var f = filesById[id] || (activeViewerFile && activeViewerFile.id === id ? activeViewerFile : null);
+    if (!f) return;
+    var busy = typeof saveProgress[id] === "number";
+    var btns = Array.prototype.slice.call(fileList.querySelectorAll("[data-save]")).filter(function (b) {
+      return b.getAttribute("data-save") === id;
+    });
+    if (activeViewerFile && activeViewerFile.id === id) btns.push(viewerSave);
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].textContent = saveLabel(f);
+      btns[i].disabled = busy;
+    }
+  }
+
   function primaryActionHtml(f) {
-    if (f.isMedia) {
-      // On phones this drives the share-sheet → Photos path
+    // On phones media goes through the share sheet → Photos. Everywhere else a
+    // plain link hands the file to the browser's download manager immediately.
+    if (f.isMedia && isMobile()) {
       return (
-        '<button type="button" class="btn primary sm" data-save="' + escapeAttr(f.id) + '">' +
-          (isMobile() ? "Save to Photos" : "Save") +
+        '<button type="button" class="btn primary sm" data-save="' + escapeAttr(f.id) + '"' +
+          (typeof saveProgress[f.id] === "number" ? " disabled" : "") + ">" +
+          escapeHtml(saveLabel(f)) +
         "</button>"
       );
     }
     return (
-      '<a class="btn primary sm" href="' + escapeAttr(f.downloadUrl) + '" download="' + escapeAttr(f.name) + '">Download</a>'
+      '<a class="btn primary sm" href="' + escapeAttr(f.downloadUrl) + '" download="' + escapeAttr(f.name) + '">' +
+        (f.isMedia ? "Save" : "Download") +
+      "</a>"
     );
   }
 
@@ -454,6 +483,14 @@
     fileCount.textContent = String(files.length);
     filesById = {};
     for (var i = 0; i < files.length; i++) filesById[files[i].id] = files[i];
+
+    // Rebuilding the list recreates every video thumbnail, which re-requests the
+    // video from the server, so only re-render when something visible changed
+    var listKey = files.map(function (f) {
+      return f.id + ":" + formatRemaining(f.remainingMs);
+    }).join("|");
+    if (listKey === lastListKey) return;
+    lastListKey = listKey;
 
     if (!files.length) {
       show(emptyState);
@@ -520,7 +557,7 @@
     for (var s = 0; s < saves.length; s++) {
       saves[s].addEventListener("click", function (ev) {
         var id = ev.currentTarget.getAttribute("data-save");
-        if (filesById[id]) saveMedia(filesById[id], ev.currentTarget);
+        if (filesById[id]) saveMedia(filesById[id]);
       });
     }
   }
@@ -528,6 +565,8 @@
   function openViewer(f) {
     activeViewerFile = f;
     viewerTitle.textContent = f.name;
+    viewerSave.textContent = isMobile() && f.isMedia ? saveLabel(f) : "Save";
+    viewerSave.disabled = typeof saveProgress[f.id] === "number";
     viewerBody.innerHTML = "";
     var src = f.previewUrl + "?t=" + encodeURIComponent(String(f.uploadedAt));
 
@@ -547,8 +586,12 @@
       video.playsInline = true;
       video.setAttribute("playsinline", "");
       video.setAttribute("webkit-playsinline", "");
-      video.preload = "metadata";
+      // Start playing straight away; the browser streams via Range requests
+      video.preload = "auto";
+      video.autoplay = true;
       viewerBody.appendChild(video);
+      var playing = video.play();
+      if (playing && playing.catch) playing.catch(function () {});
       viewerHint.innerHTML =
         "Tap Save → share sheet → <strong>Save Video</strong> / Photos. Or use the share icon in the player if shown.";
     } else {
@@ -566,67 +609,105 @@
     document.body.classList.remove("viewer-open");
   }
 
-  async function fetchAsFile(f) {
-    var res = await fetch(f.previewUrl + "?t=" + Date.now(), { cache: "no-store" });
-    if (!res.ok) throw new Error("Could not fetch file");
-    var blob = await res.blob();
-    var type = f.contentType || blob.type || "application/octet-stream";
-    // iOS is picky about HEIC/video types — use server type when present
-    return new File([blob], f.name, { type: type });
+  function startDownload(f) {
+    var a = document.createElement("a");
+    a.href = f.downloadUrl;
+    a.download = f.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
-  async function saveMedia(f, btn) {
-    var originalLabel = btn ? btn.textContent : null;
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "Saving…";
-    }
-
+  function shareSupported(f) {
+    if (!canShareFiles()) return false;
     try {
-      var file = await fetchAsFile(f);
+      var probe = new File([], f.name, { type: f.contentType || "application/octet-stream" });
+      return navigator.canShare({ files: [probe] });
+    } catch (e) {
+      return false;
+    }
+  }
 
-      // Best path into Photos on modern iOS/Android: system share sheet
-      if (canShareFiles()) {
-        var payload = { files: [file], title: f.name };
-        if (navigator.canShare(payload)) {
-          await navigator.share(payload);
-          setStatus("Shared — pick Photos / Save Image", "ok");
-          return;
-        }
+  // Download into memory, reporting progress on the Save button
+  async function fetchAsFile(f) {
+    var res = await fetch(f.downloadUrl, { cache: "no-store", credentials: "same-origin" });
+    if (!res.ok) throw new Error("Could not fetch file");
+    var total = Number(res.headers.get("Content-Length")) || f.size || 0;
+    var type = f.contentType || "application/octet-stream";
+    if (!res.body || !res.body.getReader) {
+      return new File([await res.blob()], f.name, { type: type });
+    }
+    var reader = res.body.getReader();
+    var chunks = [];
+    var loaded = 0;
+    for (;;) {
+      var step = await reader.read();
+      if (step.done) break;
+      chunks.push(step.value);
+      loaded += step.value.length;
+      var pct = total ? Math.min(99, Math.floor((loaded / total) * 100)) : 0;
+      if (pct !== saveProgress[f.id]) {
+        saveProgress[f.id] = pct;
+        refreshSaveButtons(f.id);
       }
+    }
+    // iOS is picky about HEIC/video types — use server type when present
+    return new File(chunks, f.name, { type: type });
+  }
 
-      // Fallback: open viewer for long-press Add to Photos
-      if (f.isMedia) {
-        openViewer(f);
-        if (isMobile()) {
-          showError(
-            "Your browser can't auto-save to Photos. Long-press the media → Add to Photos, or use the share icon."
-          );
-        } else {
-          // Desktop: force a normal download
-          window.location.href = f.downloadUrl;
-        }
-        return;
-      }
-
-      window.location.href = f.downloadUrl;
+  async function shareFile(f, file) {
+    try {
+      await navigator.share({ files: [file], title: f.name });
+      preparedFile = null;
+      setStatus("Shared — pick Photos / Save Image", "ok");
     } catch (err) {
-      // User cancelled share sheet — not an error
-      if (err && (err.name === "AbortError" || err.name === "NotAllowedError")) {
-        return;
-      }
-      // Last resort download
-      try {
-        window.location.href = f.downloadUrl;
-      } catch (e2) {
+      if (err && err.name === "AbortError") {
+        // Sheet dismissed; keep the file so another tap reopens it instantly
+        preparedFile = { id: f.id, file: file };
+      } else if (err && err.name === "NotAllowedError") {
+        // The tap "expired" while a big file downloaded; the next tap shares it
+        preparedFile = { id: f.id, file: file };
+        setStatus("Ready — tap Save again", "ok");
+      } else {
+        preparedFile = null;
         showError((err && err.message) || "Save failed");
       }
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = originalLabel || (isMobile() ? "Save to Photos" : "Save");
-      }
     }
+    refreshSaveButtons(f.id);
+  }
+
+  async function saveMedia(f) {
+    if (typeof saveProgress[f.id] === "number") return;
+
+    // Desktop (or no share sheet): hand off to the browser's download manager
+    if (!isMobile() || !shareSupported(f)) {
+      if (isMobile() && f.isMedia && !(activeViewerFile && activeViewerFile.id === f.id)) {
+        openViewer(f);
+        showError("Your browser can't save straight to Photos. Long-press the media → Add to Photos.");
+        return;
+      }
+      startDownload(f);
+      return;
+    }
+
+    if (preparedFile && preparedFile.id === f.id) {
+      return shareFile(f, preparedFile.file);
+    }
+
+    preparedFile = null; // free the previous file's memory
+    saveProgress[f.id] = 0;
+    refreshSaveButtons(f.id);
+    var file;
+    try {
+      file = await fetchAsFile(f);
+    } catch (err) {
+      showError((err && err.message) || "Download failed");
+      return;
+    } finally {
+      delete saveProgress[f.id];
+      refreshSaveButtons(f.id);
+    }
+    await shareFile(f, file);
   }
 
   async function loadFiles(opts) {
@@ -656,6 +737,7 @@
     } catch (err) {
       var msg = (err && err.message) || "Could not load files";
       setStatus("Offline / failed to load", "bad");
+      lastListKey = null; // the error overlays the list, so redraw on recovery
       emptyTitle.textContent = "Can't reach the inbox";
       emptyHint.textContent = msg + " — tap Refresh. Check you're on " + location.host;
       show(emptyState);
@@ -684,6 +766,7 @@
         return;
       }
       if (activeViewerFile && activeViewerFile.id === id) closeViewer();
+      if (preparedFile && preparedFile.id === id) preparedFile = null;
       await loadFiles({ forceError: true });
     } catch (e) {
       showError("Network error while deleting.");

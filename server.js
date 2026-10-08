@@ -94,6 +94,14 @@ function mediaKind(contentType, name) {
   return "file";
 }
 
+// Phones and scripts often upload as application/octet-stream; with nosniff that
+// stops browsers treating the file as video, so fall back to the extension.
+function effectiveType(contentType, name) {
+  const ct = (contentType || "").toLowerCase();
+  if (ct && ct !== "application/octet-stream") return contentType;
+  return mime.lookup(name || "") || "application/octet-stream";
+}
+
 function publicNote(meta) {
   const n = meta && meta.note;
   const text = n && typeof n.text === "string" ? n.text : "";
@@ -103,14 +111,15 @@ function publicNote(meta) {
 
 function publicFile(entry) {
   const remainingMs = Math.max(0, entry.expiresAt - Date.now());
-  const kind = mediaKind(entry.contentType, entry.originalName);
+  const contentType = effectiveType(entry.contentType, entry.originalName);
+  const kind = mediaKind(contentType, entry.originalName);
   const isMedia = kind === "image" || kind === "video";
   return {
     id: entry.id,
     name: entry.originalName,
     size: entry.size,
     sizeLabel: formatBytes(entry.size),
-    contentType: entry.contentType,
+    contentType,
     kind,
     isMedia,
     uploadedAt: entry.uploadedAt,
@@ -146,7 +155,7 @@ function streamFile(res, entry, disposition) {
     "Content-Disposition",
     `${disposition}; filename*=UTF-8''${encodeURIComponent(filename)}`
   );
-  res.setHeader("Content-Type", entry.contentType || "application/octet-stream");
+  res.setHeader("Content-Type", effectiveType(entry.contentType, filename));
   res.setHeader("Cache-Control", "private, max-age=60");
   res.setHeader("X-Content-Type-Options", "nosniff");
   // Uploaded HTML/SVG opened directly must never run script on this origin
@@ -366,8 +375,7 @@ app.post("/api/upload", (req, res) => {
     for (const f of incoming) {
       const id = nanoid(10);
       const originalName = path.basename(f.originalname);
-      const contentType =
-        f.mimetype || mime.lookup(originalName) || "application/octet-stream";
+      const contentType = effectiveType(f.mimetype, originalName);
 
       meta.files[id] = {
         id,
