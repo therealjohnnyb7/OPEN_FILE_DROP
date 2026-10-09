@@ -14,6 +14,7 @@ No accounts, no per-file links, no database, no build step. It's one Node proces
 - **Upload from anywhere.** Drag and drop or use the file picker, up to 10 files at once.
 - **Phone-friendly saving.** On a phone, **Save to Photos** opens the system share sheet so photos and videos go straight into your camera roll.
 - **Previews.** Image and video thumbnails, plus a fullscreen viewer.
+- **Containers.** Group files and a notepad together, one container per project or topic. Each container has its own link (`/c/<id>`) and QR code, and deleting a container deletes everything in it. Everything lands in the default **Inbox** until you make more.
 - **Shared notepad.** Paste a link, code or address on one device and copy it on the other. It autosaves, syncs live and never expires.
 - **QR code.** On desktop the page shows a QR code for its own URL, so you can scan it with your phone to open the same inbox. The code is generated on the server, so the URL is never sent to a third party.
 - **Auto-expiry.** Files are deleted after 24 hours by default (configurable).
@@ -90,7 +91,7 @@ Read this before you put Drop on the internet.
 
 ## How it works
 
-- `server.js` is an Express app. Multer writes uploads to `DATA_DIR/uploads/` under random names, and file metadata plus the notepad live in `DATA_DIR/meta.json`, which is written atomically through a temp file and rename.
+- `server.js` is an Express app. Multer writes uploads to `DATA_DIR/uploads/` under random names, and file metadata plus the containers and their notepads live in `DATA_DIR/meta.json`, which is written atomically through a temp file and rename.
 - Expired files are removed on every list or read, and by a sweep that runs every 5 minutes. The sweep also deletes orphaned blobs.
 - `public/` is plain HTML, CSS and JavaScript, with no framework and no bundler. Clients poll `/api/files` every 3 seconds while the tab is visible.
 - File responses support HTTP range requests, which iOS Safari needs to play video.
@@ -99,21 +100,30 @@ Read this before you put Drop on the internet.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/files` | Active files, the notepad, and server limits. |
-| `POST` | `/api/upload` | Multipart upload. Field name `file`, 1–10 files. |
+| `GET` | `/api/files?c=<id>` | One container's active files and notepad, the container list, and server limits. |
+| `POST` | `/api/upload?c=<id>` | Multipart upload into a container. Field name `file`, 1–10 files. |
 | `GET` | `/api/file/:id` | Metadata for one file. |
 | `GET` | `/api/raw/:id` | File content, inline for media and as a download otherwise. |
 | `GET` | `/api/download/:id` | File content as a download. |
 | `DELETE` | `/api/file/:id` | Delete a file. |
-| `GET` | `/api/note` | `{ text, updatedAt, maxChars }` |
-| `PUT` | `/api/note` | Body `{ "text": "..." }` replaces the notepad. |
-| `GET` | `/qr.svg` | QR code for the current origin. |
+| `GET` | `/api/note?c=<id>` | `{ text, updatedAt, maxChars }` |
+| `PUT` | `/api/note?c=<id>` | Body `{ "text": "..." }` replaces the container's notepad. |
+| `GET` | `/api/containers` | Containers with file counts. |
+| `POST` | `/api/containers` | Body `{ "name": "..." }` creates a container. |
+| `PATCH` | `/api/containers/:id` | Body `{ "name": "..." }` renames a container. |
+| `DELETE` | `/api/containers/:id` | Deletes a container with its files and notepad. The default container can't be deleted. |
+| `GET` | `/qr.svg?c=<id>` | QR code for a container's link on the current origin. |
+
+`c` is optional everywhere and defaults to `main`, the Inbox, so older scripts keep working.
 | `GET` | `/health` | Liveness check. Never password-protected. |
 
 Upload from a script:
 
 ```bash
 curl -u :$DROP_PASSWORD -F "file=@photo.jpg" https://your-drop.example.com/api/upload
+
+# into a specific container
+curl -u :$DROP_PASSWORD -F "file=@photo.jpg" "https://your-drop.example.com/api/upload?c=<id>"
 ```
 
 ## Development

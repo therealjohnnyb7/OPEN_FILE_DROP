@@ -400,7 +400,7 @@ main {
   gap: 0.75rem;
 }
 
-.notepad-header h2 {
+.notepad-header h3 {
   margin: 0;
   font-size: 1rem;
   font-weight: 650;
@@ -491,7 +491,7 @@ main {
   padding: 0 0.15rem;
 }
 
-.files-header h2 {
+.files-header h3 {
   margin: 0;
   font-size: 1rem;
   font-weight: 650;
@@ -743,6 +743,7 @@ body.viewer-open {
 }
 
 .foot {
+  margin-top: auto;
   text-align: center;
   color: var(--muted);
   font-size: 0.85rem;
@@ -792,5 +793,129 @@ body.viewer-open {
   .file-actions .btn {
     flex: 0 0 auto;
     min-width: 96px;
+  }
+}
+
+/* Containers: each one holds its own files + notepad */
+.container-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.container-tabs {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  padding: 2px;
+}
+
+.container-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.container-tab {
+  appearance: none;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 14rem;
+  min-height: 38px;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.container-tab:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.container-tab.active {
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.container-tab .tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.container-tab .tab-count {
+  font-size: 0.72rem;
+  font-weight: 700;
+  min-width: 1.2rem;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  text-align: center;
+}
+
+.container-tab.active .tab-count {
+  background: rgba(4, 47, 46, 0.16);
+}
+
+.container-bar > .btn {
+  flex: 0 0 auto;
+}
+
+.container-card {
+  flex: none;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(94, 234, 212, 0.22);
+  border-radius: calc(var(--radius) + 6px);
+  padding: 0.85rem;
+}
+
+.container-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.container-head h2 {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  min-width: 0;
+}
+
+.container-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+
+/* Inside a container the sections sit flat so the container reads as one unit */
+.container-card .dropzone,
+.container-card .notepad,
+.container-card .file-row,
+.container-card .panel {
+  box-shadow: none;
+}
+
+@media (min-width: 640px) {
+  .container-card {
+    padding: 1.1rem;
   }
 }

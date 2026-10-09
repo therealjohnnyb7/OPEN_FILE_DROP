@@ -17,6 +17,10 @@ const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES) || 100 * 1024 * 1024; 
 const MAX_NOTE_CHARS = Math.min(Number(process.env.MAX_NOTE_CHARS) || 20000, 50000);
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 const DROP_PASSWORD = process.env.DROP_PASSWORD || "";
+const DEFAULT_CONTAINER = "main";
+const MAX_CONTAINERS = 100;
+const MAX_CONTAINER_NAME = 60;
+const CONTAINER_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 // Only these kinds are served inline; everything else is forced to download
 const INLINE_KINDS = new Set(["image", "video", "audio"]);
 
@@ -32,14 +36,30 @@ try {
   process.exit(1);
 }
 
+// Every file and the notepad belong to a container. Older meta.json files had one
+// global note and no containers, so they're folded into the default container here.
+function normalizeMeta(meta) {
+  if (!meta || typeof meta !== "object") meta = {};
+  if (!meta.files || typeof meta.files !== "object") meta.files = {};
+  if (!meta.containers || typeof meta.containers !== "object") meta.containers = {};
+  if (!Object.prototype.hasOwnProperty.call(meta.containers, DEFAULT_CONTAINER)) {
+    meta.containers[DEFAULT_CONTAINER] = { id: DEFAULT_CONTAINER, name: "Inbox", createdAt: 0 };
+  }
+  if (meta.note) {
+    if (!meta.containers[DEFAULT_CONTAINER].note) meta.containers[DEFAULT_CONTAINER].note = meta.note;
+    delete meta.note;
+  }
+  for (const entry of Object.values(meta.files)) {
+    if (!entry.containerId || !getContainer(meta, entry.containerId)) entry.containerId = DEFAULT_CONTAINER;
+  }
+  return meta;
+}
+
 function loadMeta() {
   try {
-    const meta = JSON.parse(fs.readFileSync(META_PATH, "utf8"));
-    if (!meta || typeof meta !== "object") return { files: {} };
-    if (!meta.files || typeof meta.files !== "object") meta.files = {};
-    return meta;
+    return normalizeMeta(JSON.parse(fs.readFileSync(META_PATH, "utf8")));
   } catch {
-    return { files: {} };
+    return normalizeMeta({});
   }
 }
 
@@ -52,6 +72,22 @@ function saveMeta(meta) {
 // Own-property lookup so ids like "__proto__" or "constructor" never resolve
 function getEntry(meta, id) {
   return Object.prototype.hasOwnProperty.call(meta.files, id) ? meta.files[id] : null;
+}
+
+function getContainer(meta, id) {
+  if (typeof id !== "string" || !CONTAINER_ID_RE.test(id)) return null;
+  return Object.prototype.hasOwnProperty.call(meta.containers, id) ? meta.containers[id] : null;
+}
+
+// ?c= on the query string; missing means the default container
+function requestContainerId(req) {
+  const c = req.query && typeof req.query.c === "string" ? req.query.c : "";
+  return c || DEFAULT_CONTAINER;
+}
+
+function cleanContainerName(name) {
+  if (typeof name !== "string") return "";
+  return name.replace(/\s+/g, " ").trim().slice(0, MAX_CONTAINER_NAME);
 }
 
 function formatBytes(n) {
@@ -102,8 +138,8 @@ function effectiveType(contentType, name) {
   return mime.lookup(name || "") || "application/octet-stream";
 }
 
-function publicNote(meta) {
-  const n = meta && meta.note;
+function publicNote(container) {
+  const n = container && container.note;
   const text = n && typeof n.text === "string" ? n.text : "";
   const updatedAt = n && typeof n.updatedAt === "number" ? n.updatedAt : 0;
   return { text, updatedAt, maxChars: MAX_NOTE_CHARS };
@@ -116,6 +152,7 @@ function publicFile(entry) {
   const isMedia = kind === "image" || kind === "video";
   return {
     id: entry.id,
+    containerId: entry.containerId,
     name: entry.originalName,
     size: entry.size,
     sizeLabel: formatBytes(entry.size),
@@ -168,24 +205,32 @@ function streamFile(res, entry, disposition) {
   });
 }
 
-function listActiveFiles() {
-  const meta = loadMeta();
+// Drops expired files from meta (saving if anything changed) and returns the rest
+function pruneExpired(meta) {
   let dirty = false;
-  const files = [];
-
   for (const [id, entry] of Object.entries(meta.files)) {
     if (isExpired(entry)) {
       deleteFile(id, meta);
       dirty = true;
-      continue;
     }
-    files.push(publicFile(entry));
   }
-
   if (dirty) saveMeta(meta);
+  return Object.values(meta.files);
+}
 
-  files.sort((a, b) => b.uploadedAt - a.uploadedAt);
-  return files;
+function publicContainers(meta, entries) {
+  const counts = {};
+  for (const e of entries) counts[e.containerId] = (counts[e.containerId] || 0) + 1;
+  return Object.values(meta.containers)
+    .map((c) => ({
+      id: c.id,
+      name: c.name,
+      createdAt: c.createdAt,
+      fileCount: counts[c.id] || 0,
+      hasNote: !!(c.note && c.note.text),
+      isDefault: c.id === DEFAULT_CONTAINER,
+    }))
+    .sort((a, b) => a.createdAt - b.createdAt);
 }
 
 function cleanupExpired() {
@@ -289,7 +334,9 @@ app.get("/qr.svg", async (req, res) => {
     return res.status(400).type("text/plain").send("Invalid origin");
   }
   try {
-    const svg = await QRCode.toString(origin + "/", {
+    const c = typeof req.query.c === "string" ? req.query.c : "";
+    const target = c && c !== DEFAULT_CONTAINER && CONTAINER_ID_RE.test(c) ? "/c/" + c : "/";
+    const svg = await QRCode.toString(origin + target, {
       type: "svg",
       errorCorrectionLevel: "M",
       margin: 1,
@@ -305,26 +352,94 @@ app.get("/qr.svg", async (req, res) => {
   }
 });
 
-// Shared inbox — every device sees the same list
-app.get("/api/files", (_req, res) => {
+// Container links open the same app; the client reads the id from the path
+app.get("/c/:id", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// One container's files + notepad, plus the container list. Every device sees the same.
+app.get("/api/files", (req, res) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   res.setHeader("Pragma", "no-cache");
-  const files = listActiveFiles();
   const meta = loadMeta();
+  const container = getContainer(meta, requestContainerId(req));
+  if (!container) {
+    return res.status(404).json({ error: "Container not found", code: "container_not_found" });
+  }
+  const entries = pruneExpired(meta);
+  const files = entries
+    .filter((e) => e.containerId === container.id)
+    .map(publicFile)
+    .sort((a, b) => b.uploadedAt - a.uploadedAt);
   res.json({
+    container: { id: container.id, name: container.name, isDefault: container.id === DEFAULT_CONTAINER },
+    containers: publicContainers(meta, entries),
     files,
     count: files.length,
-    note: publicNote(meta),
+    note: publicNote(container),
     maxFileBytes: MAX_FILE_BYTES,
     ttlHours: TTL_HOURS,
     serverTime: Date.now(),
   });
 });
 
-app.get("/api/note", (_req, res) => {
+app.get("/api/containers", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  const meta = loadMeta();
+  res.json({ containers: publicContainers(meta, pruneExpired(meta)) });
+});
+
+app.post("/api/containers", (req, res) => {
+  const name = cleanContainerName(req.body && req.body.name);
+  if (!name) return res.status(400).json({ error: "Name is required" });
+  const meta = loadMeta();
+  if (Object.keys(meta.containers).length >= MAX_CONTAINERS) {
+    return res.status(400).json({ error: `Too many containers (max ${MAX_CONTAINERS}).` });
+  }
+  const id = nanoid(8);
+  meta.containers[id] = { id, name, createdAt: Date.now() };
+  saveMeta(meta);
+  res.status(201).json({ container: publicContainers(meta, []).find((c) => c.id === id) });
+});
+
+app.patch("/api/containers/:id", (req, res) => {
+  const name = cleanContainerName(req.body && req.body.name);
+  if (!name) return res.status(400).json({ error: "Name is required" });
+  const meta = loadMeta();
+  const container = getContainer(meta, req.params.id);
+  if (!container) return res.status(404).json({ error: "Container not found" });
+  container.name = name;
+  saveMeta(meta);
+  res.json({ ok: true, id: container.id, name });
+});
+
+// Deleting a container deletes its files and notepad with it
+app.delete("/api/containers/:id", (req, res) => {
+  const meta = loadMeta();
+  const container = getContainer(meta, req.params.id);
+  if (!container) return res.status(404).json({ error: "Container not found" });
+  if (container.id === DEFAULT_CONTAINER) {
+    return res.status(400).json({ error: "The default container can't be deleted" });
+  }
+  let removedFiles = 0;
+  for (const [id, entry] of Object.entries(meta.files)) {
+    if (entry.containerId === container.id) {
+      deleteFile(id, meta);
+      removedFiles++;
+    }
+  }
+  delete meta.containers[container.id];
+  saveMeta(meta);
+  res.json({ ok: true, id: container.id, removedFiles });
+});
+
+app.get("/api/note", (req, res) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   res.setHeader("Pragma", "no-cache");
-  res.json(publicNote(loadMeta()));
+  const container = getContainer(loadMeta(), requestContainerId(req));
+  if (!container) return res.status(404).json({ error: "Container not found" });
+  res.json(publicNote(container));
 });
 
 app.put("/api/note", (req, res) => {
@@ -340,9 +455,11 @@ app.put("/api/note", (req, res) => {
   }
 
   const meta = loadMeta();
-  meta.note = { text, updatedAt: Date.now() };
+  const container = getContainer(meta, requestContainerId(req));
+  if (!container) return res.status(404).json({ error: "Container not found" });
+  container.note = { text, updatedAt: Date.now() };
   saveMeta(meta);
-  res.json(publicNote(meta));
+  res.json(publicNote(container));
 });
 
 app.post("/api/upload", (req, res) => {
@@ -369,6 +486,11 @@ app.post("/api/upload", (req, res) => {
     }
 
     const meta = loadMeta();
+    const container = getContainer(meta, requestContainerId(req));
+    if (!container) {
+      for (const f of incoming) fs.unlink(f.path, () => {});
+      return res.status(404).json({ error: "Container not found" });
+    }
     const now = Date.now();
     const created = [];
 
@@ -379,6 +501,7 @@ app.post("/api/upload", (req, res) => {
 
       meta.files[id] = {
         id,
+        containerId: container.id,
         originalName,
         storedName: f.filename,
         size: f.size,

@@ -30,6 +30,12 @@
   const noteCount = document.getElementById("noteCount");
   const tagline = document.getElementById("tagline");
   const dropHint = document.getElementById("dropHint");
+  const containerTabs = document.getElementById("containerTabs");
+  const containerNew = document.getElementById("containerNew");
+  const containerName = document.getElementById("containerName");
+  const containerRename = document.getElementById("containerRename");
+  const containerDelete = document.getElementById("containerDelete");
+  const qrImg = document.getElementById("qrImg");
 
   const POLL_MS = 3000;
   const NOTE_SAVE_MS = 450;
@@ -41,6 +47,8 @@
   let lastListKey = null;
   // Phone save state: the share sheet needs the whole file in memory first
   let saveProgress = {}; // id -> percent while downloading
+  let saveRetrying = {}; // id -> true while waiting to retry a dropped chunk
+  let partials = {}; // id -> { parts, loaded } kept after a failed save so the next tap resumes
   let preparedFile = null; // { id, file } kept so a second tap shares instantly
   let activeViewerFile = null;
   let noteDirty = false;
@@ -50,10 +58,33 @@
   let lastNoteUpdatedAt = 0;
   let lastSavedText = "";
   let maxNoteChars = 20000;
+  // Each container has its own files + notepad; the id lives in the URL (/c/:id)
+  const DEFAULT_CONTAINER = "main";
+  let currentContainer = containerFromPath();
+  let currentContainerInfo = null;
+  let containerGen = 0; // bumped on every switch so stale responses are ignored
+  let lastTabsKey = null;
 
-  if (pageUrl) pageUrl.textContent = location.origin + "/";
+  function containerFromPath() {
+    var m = location.pathname.match(/^\/c\/([A-Za-z0-9_-]{1,32})\/?$/);
+    return m ? m[1] : DEFAULT_CONTAINER;
+  }
 
-  var qrImg = document.getElementById("qrImg");
+  function containerPath(id) {
+    return id === DEFAULT_CONTAINER ? "/" : "/c/" + id;
+  }
+
+  function withContainer(url, id) {
+    return url + (url.indexOf("?") === -1 ? "?" : "&") + "c=" + encodeURIComponent(id || currentContainer);
+  }
+
+  function showContainerLink() {
+    if (pageUrl) pageUrl.textContent = location.origin + containerPath(currentContainer);
+    if (qrImg) qrImg.src = withContainer("/qr.svg");
+  }
+
+  showContainerLink();
+
   if (qrImg) {
     qrImg.addEventListener("error", function () {
       var card = qrImg.closest(".qr-card");
@@ -153,7 +184,7 @@
     var text = noteBody(noteInput.value);
     if (!noteDirty && text === lastSavedText) return;
     try {
-      fetch("/api/note", {
+      fetch(withContainer("/api/note"), {
         method: "PUT",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         cache: "no-store",
@@ -168,12 +199,13 @@
     if (noteSaving) return;
     var text = noteBody(noteInput.value);
     if (text === lastSavedText && !noteDirty) return;
+    var gen = containerGen;
     noteSaving = true;
     noteDirty = false;
     var retryAfter = false;
     setNoteStatus("Saving…", "busy");
     try {
-      var res = await fetch("/api/note", {
+      var res = await fetch(withContainer("/api/note"), {
         method: "PUT",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         cache: "no-store",
@@ -184,6 +216,7 @@
       try {
         data = await res.json();
       } catch (e) {}
+      if (gen !== containerGen) return;
       if (!res.ok) {
         noteDirty = true;
         setNoteStatus((data && data.error) || "Save failed", "bad");
@@ -204,10 +237,13 @@
         setNoteStatus("Saved", "ok");
       }
     } catch (e) {
+      if (gen !== containerGen) return;
       noteDirty = true;
       setNoteStatus("Save failed — check connection", "bad");
       scheduleNoteRetry();
     } finally {
+      // A switch already reset the note state for the new container
+      if (gen !== containerGen) return;
       noteSaving = false;
       if (retryAfter) {
         if (noteTimer) clearTimeout(noteTimer);
@@ -246,7 +282,7 @@
 
   function clearNote() {
     if (!noteInput.value) return;
-    if (noteInput.value.length > 80 && !window.confirm("Clear the notepad on every device?")) {
+    if (noteInput.value.length > 80 && !window.confirm("Clear this container's notepad on every device?")) {
       return;
     }
     noteInput.value = "";
@@ -441,7 +477,10 @@
   }
 
   function saveLabel(f) {
-    if (typeof saveProgress[f.id] === "number") return "Loading " + saveProgress[f.id] + "%";
+    if (typeof saveProgress[f.id] === "number") {
+      return (saveRetrying[f.id] ? "Reconnecting " : "Loading ") + saveProgress[f.id] + "%";
+    }
+    if (partials[f.id]) return "Resume " + Math.floor((partials[f.id].loaded / (f.size || 1)) * 100) + "%";
     if (preparedFile && preparedFile.id === f.id) return "Tap to save";
     return "Save to Photos";
   }
@@ -494,7 +533,7 @@
 
     if (!files.length) {
       show(emptyState);
-      emptyTitle.textContent = "No files yet.";
+      emptyTitle.textContent = "No files in this container yet.";
       emptyHint.textContent = "Upload from this phone or your PC — they show up here.";
       fileList.innerHTML = "";
       knownIds = new Set();
@@ -628,31 +667,135 @@
     }
   }
 
+  // Slow or flaky links (VPNs especially) drop long connections, so files come down
+  // in short Range requests. A dropped request only costs the bytes not yet received:
+  // it's retried from where it stopped, and chunk size adapts to the connection speed.
+  var CHUNK_START = 1024 * 1024;
+  var CHUNK_MIN = 256 * 1024;
+  var CHUNK_MAX = 8 * 1024 * 1024;
+  var CHUNK_TARGET_MS = 4000; // aim for each request to finish in about this long
+  var STALL_MS = 10000; // abort a request that receives nothing for this long
+  var MAX_FAILS = 8; // consecutive attempts with zero progress before giving up
+
+  function fatalError(msg) {
+    var err = new Error(msg);
+    err.fatal = true;
+    return err;
+  }
+
+  function wait(ms) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  // iOS suspends background tabs and their requests; retry once the page is back
+  function whenVisible() {
+    if (!document.hidden) return Promise.resolve();
+    return new Promise(function (resolve) {
+      function onChange() {
+        if (document.hidden) return;
+        document.removeEventListener("visibilitychange", onChange);
+        resolve();
+      }
+      document.addEventListener("visibilitychange", onChange);
+    });
+  }
+
+  // Fetch bytes start..end (inclusive), handing each piece to onData as it arrives.
+  // Throws on any failure; bytes already passed to onData are kept by the caller.
+  async function fetchRange(f, start, end, onData) {
+    var controller = new AbortController();
+    var stallTimer = null;
+    function armStall() {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(function () {
+        controller.abort();
+      }, STALL_MS);
+    }
+    armStall();
+    try {
+      var res = await fetch(f.downloadUrl, {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { Range: "bytes=" + start + "-" + end },
+        signal: controller.signal,
+      });
+      if (res.status === 404 || res.status === 410) throw fatalError("This file has expired or was deleted.");
+      if (res.status === 200 && start > 0) throw fatalError("The server doesn't support resuming downloads.");
+      if (res.status !== 206 && res.status !== 200) throw new Error("Server returned " + res.status);
+      if (res.status === 206) {
+        var range = /bytes (\d+)-/.exec(res.headers.get("Content-Range") || "");
+        if (range && Number(range[1]) !== start) throw new Error("Unexpected range from server");
+      }
+      if (!res.body || !res.body.getReader) {
+        onData(new Uint8Array(await res.arrayBuffer()));
+        return;
+      }
+      var reader = res.body.getReader();
+      for (;;) {
+        armStall();
+        var step = await reader.read();
+        if (step.done) return;
+        onData(step.value);
+      }
+    } finally {
+      clearTimeout(stallTimer);
+    }
+  }
+
   // Download into memory, reporting progress on the Save button
   async function fetchAsFile(f) {
-    var res = await fetch(f.downloadUrl, { cache: "no-store", credentials: "same-origin" });
-    if (!res.ok) throw new Error("Could not fetch file");
-    var total = Number(res.headers.get("Content-Length")) || f.size || 0;
-    var type = f.contentType || "application/octet-stream";
-    if (!res.body || !res.body.getReader) {
-      return new File([await res.blob()], f.name, { type: type });
-    }
-    var reader = res.body.getReader();
-    var chunks = [];
-    var loaded = 0;
-    for (;;) {
-      var step = await reader.read();
-      if (step.done) break;
-      chunks.push(step.value);
-      loaded += step.value.length;
-      var pct = total ? Math.min(99, Math.floor((loaded / total) * 100)) : 0;
-      if (pct !== saveProgress[f.id]) {
+    var total = f.size;
+    var state = partials[f.id] || { parts: [], loaded: 0 };
+    delete partials[f.id];
+    var chunk = CHUNK_START;
+    var fails = 0;
+
+    function onData(bytes) {
+      state.parts.push(bytes);
+      state.loaded += bytes.length;
+      var pct = Math.min(99, Math.floor((state.loaded / total) * 100));
+      if (pct !== saveProgress[f.id] || saveRetrying[f.id]) {
         saveProgress[f.id] = pct;
+        delete saveRetrying[f.id];
         refreshSaveButtons(f.id);
       }
     }
+
+    while (state.loaded < total) {
+      var before = state.loaded;
+      var startedAt = Date.now();
+      try {
+        await fetchRange(f, state.loaded, Math.min(total, state.loaded + chunk) - 1, onData);
+        fails = 0;
+        var rate = (state.loaded - before) / Math.max(1, Date.now() - startedAt);
+        chunk = Math.round(Math.min(CHUNK_MAX, Math.max(CHUNK_MIN, rate * CHUNK_TARGET_MS)));
+      } catch (err) {
+        if (err && err.fatal) throw err;
+        if (state.loaded > total) throw fatalError("Download size mismatch — tap Save to try again.");
+        chunk = Math.max(CHUNK_MIN, Math.floor(chunk / 2));
+        if (document.hidden) {
+          await whenVisible();
+          continue;
+        }
+        fails = state.loaded > before ? 0 : fails + 1;
+        if (fails >= MAX_FAILS) {
+          if (state.loaded > 0) partials[f.id] = state;
+          throw new Error(
+            "Download keeps dropping at " + Math.floor((state.loaded / total) * 100) +
+            "%. Check your connection, then tap Resume."
+          );
+        }
+        saveRetrying[f.id] = true;
+        refreshSaveButtons(f.id);
+        await wait(Math.min(8000, 500 * Math.pow(2, Math.max(0, fails - 1))));
+      }
+    }
+    delete saveRetrying[f.id];
+    if (state.loaded !== total) throw fatalError("Download size mismatch — tap Save to try again.");
     // iOS is picky about HEIC/video types — use server type when present
-    return new File(chunks, f.name, { type: type });
+    return new File(state.parts, f.name, { type: f.contentType || "application/octet-stream" });
   }
 
   async function shareFile(f, file) {
@@ -695,7 +838,7 @@
     }
 
     preparedFile = null; // free the previous file's memory
-    saveProgress[f.id] = 0;
+    saveProgress[f.id] = partials[f.id] ? Math.floor((partials[f.id].loaded / (f.size || 1)) * 100) : 0;
     refreshSaveButtons(f.id);
     var file;
     try {
@@ -705,6 +848,7 @@
       return;
     } finally {
       delete saveProgress[f.id];
+      delete saveRetrying[f.id];
       refreshSaveButtons(f.id);
     }
     await shareFile(f, file);
@@ -714,20 +858,31 @@
     opts = opts || {};
     if (loadInFlight) return;
     loadInFlight = true;
+    var gen = containerGen;
     if (opts.forceError) refreshBtn.classList.add("spinning");
 
     try {
-      var url = "/api/files?t=" + Date.now();
+      var url = withContainer("/api/files?t=" + Date.now());
       var res = await fetch(url, {
         cache: "no-store",
         credentials: "same-origin",
         headers: { Accept: "application/json" },
       });
+      if (gen !== containerGen) return;
 
+      if (res.status === 404 && currentContainer !== DEFAULT_CONTAINER) {
+        // Deleted on another device (or a bad link) — fall back to the default container
+        loadInFlight = false;
+        switchContainer(DEFAULT_CONTAINER, { replace: true });
+        showError("That container no longer exists.");
+        return;
+      }
       if (!res.ok) throw new Error("Server returned " + res.status);
 
       var data = await res.json();
+      if (gen !== containerGen) return;
       var files = data.files || [];
+      renderContainers(data.containers || [], data.container);
       renderFiles(files);
       applyRemoteNote(data.note);
       applyLimits(data);
@@ -735,7 +890,9 @@
       hide(errorPanel);
       setStatus(files.length + " file" + (files.length === 1 ? "" : "s") + " · live", "ok");
     } catch (err) {
-      var msg = (err && err.message) || "Could not load files";
+      if (gen !== containerGen) return;
+      // Safari says "Load failed" and Chrome "Failed to fetch" for a dropped connection
+      var msg = err instanceof TypeError ? "Connection dropped" : (err && err.message) || "Could not load files";
       setStatus("Offline / failed to load", "bad");
       lastListKey = null; // the error overlays the list, so redraw on recovery
       emptyTitle.textContent = "Can't reach the inbox";
@@ -767,6 +924,7 @@
       }
       if (activeViewerFile && activeViewerFile.id === id) closeViewer();
       if (preparedFile && preparedFile.id === id) preparedFile = null;
+      delete partials[id];
       await loadFiles({ forceError: true });
     } catch (e) {
       showError("Network error while deleting.");
@@ -786,7 +944,7 @@
     for (var i = 0; i < files.length; i++) form.append("file", files[i]);
 
     var xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/upload");
+    xhr.open("POST", withContainer("/api/upload"));
 
     xhr.upload.addEventListener("progress", function (e) {
       if (!e.lengthComputable) return;
@@ -821,6 +979,153 @@
 
     xhr.send(form);
   }
+
+  function renderContainers(list, active) {
+    if (active) {
+      currentContainerInfo = active;
+      containerName.textContent = active.name;
+      containerName.title = active.name;
+      document.title = active.name + " · Drop";
+      containerDelete.classList.toggle("hidden", !!active.isDefault);
+    }
+    var key = currentContainer + "|" + list.map(function (c) {
+      return c.id + ":" + c.name + ":" + c.fileCount;
+    }).join("|");
+    if (key === lastTabsKey) return;
+    lastTabsKey = key;
+    var html = "";
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i];
+      var isActive = c.id === currentContainer;
+      html +=
+        '<button type="button" class="container-tab' + (isActive ? " active" : "") + '" data-container="' + escapeAttr(c.id) + '"' +
+          (isActive ? ' aria-current="true"' : "") + ' title="' + escapeAttr(c.name) + '">' +
+          '<span class="tab-name">' + escapeHtml(c.name) + "</span>" +
+          '<span class="tab-count">' + c.fileCount + "</span>" +
+        "</button>";
+    }
+    containerTabs.innerHTML = html;
+    // Keep the active tab in view without scrolling the page
+    var activeTab = containerTabs.querySelector(".container-tab.active");
+    if (activeTab) {
+      containerTabs.scrollLeft = Math.max(0, activeTab.offsetLeft - (containerTabs.clientWidth - activeTab.offsetWidth) / 2);
+    }
+  }
+
+  function switchContainer(id, opts) {
+    opts = opts || {};
+    if (id === currentContainer && !opts.force) return;
+
+    // Push any unsaved notepad text to the container we're leaving
+    flushNoteKeepalive();
+    if (noteTimer) clearTimeout(noteTimer);
+    if (noteRetryTimer) clearTimeout(noteRetryTimer);
+    noteTimer = null;
+    noteRetryTimer = null;
+
+    containerGen++;
+    currentContainer = id;
+    currentContainerInfo = null;
+    noteDirty = false;
+    noteSaving = false;
+    lastNoteUpdatedAt = 0;
+    lastSavedText = "";
+    noteInput.value = "";
+    updateNoteCount();
+    setNoteStatus("Loading…", null);
+
+    if (!viewer.classList.contains("hidden")) closeViewer();
+    preparedFile = null;
+    filesById = {};
+    knownIds = new Set();
+    lastListKey = null;
+    lastTabsKey = null;
+    fileList.innerHTML = "";
+    fileCount.textContent = "—";
+    emptyTitle.textContent = "Loading files…";
+    emptyHint.textContent = "Opening this container.";
+    show(emptyState);
+    containerDelete.classList.add("hidden");
+
+    if (!opts.fromHistory) {
+      var path = containerPath(id);
+      if (opts.replace) history.replaceState(null, "", path);
+      else history.pushState(null, "", path);
+    }
+    showContainerLink();
+    loadInFlight = false;
+    loadFiles({ forceError: true });
+  }
+
+  async function containerRequest(method, url, body) {
+    var res = await fetch(url, {
+      method: method,
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      cache: "no-store",
+      credentials: "same-origin",
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    var data = {};
+    try {
+      data = await res.json();
+    } catch (e) {}
+    if (!res.ok) throw new Error((data && data.error) || "Request failed");
+    return data;
+  }
+
+  async function createContainer() {
+    var name = window.prompt("Name the new container", "");
+    if (name === null) return;
+    name = name.trim();
+    if (!name) return;
+    try {
+      var data = await containerRequest("POST", "/api/containers", { name: name });
+      switchContainer(data.container.id);
+    } catch (e) {
+      showError(e.message || "Could not create container");
+    }
+  }
+
+  async function renameContainer() {
+    var current = currentContainerInfo ? currentContainerInfo.name : "";
+    var name = window.prompt("Rename container", current);
+    if (name === null) return;
+    name = name.trim();
+    if (!name || name === current) return;
+    try {
+      await containerRequest("PATCH", "/api/containers/" + encodeURIComponent(currentContainer), { name: name });
+      lastTabsKey = null;
+      loadFiles({ forceError: true });
+    } catch (e) {
+      showError(e.message || "Rename failed");
+    }
+  }
+
+  async function deleteContainer() {
+    if (!currentContainerInfo || currentContainerInfo.isDefault) return;
+    var n = Object.keys(filesById).length;
+    var msg = "Delete \"" + currentContainerInfo.name + "\" on every device?\n\n" +
+      "Its notepad" + (n ? " and " + n + " file" + (n === 1 ? "" : "s") : "") + " will be deleted too.";
+    if (!window.confirm(msg)) return;
+    try {
+      await containerRequest("DELETE", "/api/containers/" + encodeURIComponent(currentContainer));
+      noteDirty = false; // don't flush the note into a container that's gone
+      switchContainer(DEFAULT_CONTAINER, { replace: true });
+    } catch (e) {
+      showError(e.message || "Delete failed");
+    }
+  }
+
+  containerTabs.addEventListener("click", function (e) {
+    var tab = e.target.closest("[data-container]");
+    if (tab) switchContainer(tab.getAttribute("data-container"));
+  });
+  containerNew.addEventListener("click", createContainer);
+  containerRename.addEventListener("click", renameContainer);
+  containerDelete.addEventListener("click", deleteContainer);
+  window.addEventListener("popstate", function () {
+    switchContainer(containerFromPath(), { fromHistory: true });
+  });
 
   function startPolling() {
     if (pollTimer) clearInterval(pollTimer);

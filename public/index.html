@@ -9,7 +9,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <title>Drop · Shared Inbox</title>
-  <link rel="stylesheet" href="/styles.css?v=8" />
+  <link rel="stylesheet" href="/styles.css?v=9" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>" />
 </head>
 <body>
@@ -35,7 +35,20 @@
       </figure>
     </header>
 
-    <main>
+    <nav class="container-bar" aria-label="Containers">
+      <div id="containerTabs" class="container-tabs"></div>
+      <button type="button" class="btn ghost sm" id="containerNew">+ New</button>
+    </nav>
+
+    <main id="containerCard" class="container-card">
+      <div class="container-head">
+        <h2 id="containerName" class="truncate">Inbox</h2>
+        <div class="container-actions">
+          <button type="button" class="btn ghost sm" id="containerRename">Rename</button>
+          <button type="button" class="btn ghost sm danger-btn hidden" id="containerDelete">Delete</button>
+        </div>
+      </div>
+
       <section id="dropzone" class="dropzone compact" tabindex="0" role="button" aria-label="Upload files">
         <input type="file" id="fileInput" class="sr-only" multiple accept="*/*" />
         <div class="dropzone-inner">
@@ -54,7 +67,7 @@
 
       <section id="notepad" class="notepad" aria-label="Shared notepad">
         <div class="notepad-header">
-          <h2>Notepad</h2>
+          <h3>Notepad</h3>
           <div class="notepad-actions">
             <button type="button" class="btn ghost sm" id="noteCopy">Copy</button>
             <button type="button" class="btn ghost sm danger-btn" id="noteClear">Clear</button>
@@ -71,7 +84,7 @@
           autocapitalize="off"
         ></textarea>
         <div class="notepad-foot">
-          <span id="noteStatus" class="note-status">Shared · live on every device</span>
+          <span id="noteStatus" class="note-status">Synced · live on every device</span>
           <span id="noteCount" class="note-count mono"></span>
         </div>
       </section>
@@ -91,7 +104,7 @@
 
       <section class="files-section">
         <div class="files-header">
-          <h2>Files <span id="fileCount" class="count-pill">—</span></h2>
+          <h3>Files <span id="fileCount" class="count-pill">—</span></h3>
           <button type="button" class="btn ghost sm" id="refreshBtn" title="Refresh">Refresh</button>
         </div>
         <div id="emptyState" class="empty-state">
@@ -121,6 +134,6 @@
     </p>
   </div>
 
-  <script src="/app.js?v=8"></script>
+  <script src="/app.js?v=9"></script>
 </body>
 </html>
