@@ -1,7 +1,7 @@
 {
   "name": "drop",
   "version": "1.0.0",
-  "description": "Self-hosted shared inbox for moving files between your own devices. Files auto-delete after 24 hours.",
+  "description": "Shared inbox for moving files between your own devices, on Cloudflare Workers. Files auto-delete after 24 hours.",
   "license": "MIT",
   "author": "Jon Broadbent",
   "repository": {
@@ -14,21 +14,19 @@
     "airdrop",
     "inbox",
     "ephemeral",
-    "qr-code"
+    "qr-code",
+    "cloudflare-workers",
+    "r2"
   ],
-  "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
-  },
-  "engines": {
-    "node": ">=20"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "express": "^4.22.3",
     "mime-types": "^2.1.35",
-    "multer": "^2.4.0",
-    "nanoid": "^3.3.8",
     "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "wrangler": "^4.154.0"
   }
 }

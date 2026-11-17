@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "drop",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // The Worker runs first so DROP_PASSWORD covers the whole app
+    "run_worker_first": true
+  },
+  // Wrangler creates the bucket and database on the first deploy
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "drop-files" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "drop-meta" }],
+  // Sweep expired files, unfinished uploads and orphaned blobs
+  "triggers": { "crons": ["*/15 * * * *"] },
+  "vars": {
+    "TTL_HOURS": "24",
+    "MAX_FILE_BYTES": "2147483648",
+    "MAX_NOTE_CHARS": "20000"
+  },
+  // Set DROP_PASSWORD with: npx wrangler secret put DROP_PASSWORD
+  "observability": { "enabled": true }
+}

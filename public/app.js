@@ -1,4 +1,9 @@
 (() => {
+  // Signed out (session expired)? Go sign in, then come straight back.
+  const signIn = () => { location.href = "https://auth.thejonbroadbent.com/login?next=" + encodeURIComponent(location.href); };
+  const rawFetch = window.fetch.bind(window);
+  window.fetch = (...args) => rawFetch(...args).then((r) => { if (r.status === 401) signIn(); return r; });
+
   const dropzone = document.getElementById("dropzone");
   const fileInput = document.getElementById("fileInput");
   const browseBtn = document.getElementById("browseBtn");
@@ -316,7 +321,9 @@
 
   // Server config (max size, TTL) is env-driven, so the copy follows it
   function applyLimits(data) {
+    if (data.upload) uploadLimits = data.upload;
     if (data.maxFileBytes > 0) {
+      maxFileBytes = data.maxFileBytes;
       dropHint.textContent = "Photos, videos, anything · max " + formatSize(data.maxFileBytes);
     }
     if (data.ttlHours > 0) {
@@ -931,8 +938,118 @@
     }
   }
 
-  function uploadFiles(files) {
+  // Upload limits come from /api/files; these defaults match the server
+  let uploadLimits = { singlePutMax: 20 * 1024 * 1024, partSize: 10 * 1024 * 1024 };
+  let maxFileBytes = 0;
+  const PART_CONCURRENCY = 3;
+  const PART_RETRIES = 5;
+
+  function uploadError(msg, fatal) {
+    var err = new Error(msg);
+    err.fatal = !!fatal;
+    return err;
+  }
+
+  // One XHR so the browser reports upload progress
+  function sendXhr(method, url, body, contentType, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open(method, url);
+      if (contentType) xhr.setRequestHeader("Content-Type", contentType);
+      xhr.upload.addEventListener("progress", function (e) {
+        if (e.lengthComputable && onProgress) onProgress(e.loaded);
+      });
+      xhr.addEventListener("load", function () {
+        var data = null;
+        try {
+          data = JSON.parse(xhr.responseText);
+        } catch (e) {}
+        if (xhr.status === 401) signIn();
+        if (xhr.status >= 200 && xhr.status < 300 && data) return resolve(data);
+        var msg = (data && data.error) || "Upload failed (" + xhr.status + ").";
+        // 4xx means the request itself is wrong; retrying won't help
+        reject(uploadError(msg, xhr.status >= 400 && xhr.status < 500 && xhr.status !== 408 && xhr.status !== 429));
+      });
+      xhr.addEventListener("error", function () {
+        reject(uploadError("Network error. Check your connection and try again."));
+      });
+      xhr.send(body);
+    });
+  }
+
+  function sleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
+  async function uploadOne(file, onProgress) {
+    var type = file.type || "application/octet-stream";
+    if (file.size <= uploadLimits.singlePutMax) {
+      var url = withContainer("/api/upload?name=" + encodeURIComponent(file.name));
+      return sendXhr("PUT", url, file, type, onProgress);
+    }
+
+    // Large file: send it in parts, a few at a time, retrying any part that drops
+    var start = await containerRequest("POST", withContainer("/api/uploads"), {
+      name: file.name,
+      size: file.size,
+      type: type,
+    });
+    var partSize = start.partSize;
+    var partCount = start.partCount;
+    var loaded = {};
+    var results = new Array(partCount);
+    var next = 1;
+    function report() {
+      var sum = 0;
+      for (var k in loaded) sum += loaded[k];
+      onProgress(sum);
+    }
+    async function worker() {
+      while (next <= partCount) {
+        var n = next++;
+        var blob = file.slice((n - 1) * partSize, Math.min(file.size, n * partSize));
+        for (var attempt = 0; ; attempt++) {
+          try {
+            results[n - 1] = await sendXhr("PUT", "/api/uploads/" + start.id + "/" + n, blob, "application/octet-stream", function (b) {
+              loaded[n] = b;
+              report();
+            });
+            loaded[n] = blob.size;
+            report();
+            break;
+          } catch (err) {
+            loaded[n] = 0;
+            report();
+            if (err.fatal || attempt >= PART_RETRIES) throw err;
+            await sleep(Math.min(8000, 500 * Math.pow(2, attempt)));
+          }
+        }
+      }
+    }
+    try {
+      var workers = [];
+      for (var w = 0; w < Math.min(PART_CONCURRENCY, partCount); w++) workers.push(worker());
+      await Promise.all(workers);
+      return await containerRequest("POST", "/api/uploads/" + start.id + "/complete", {
+        parts: results.map(function (r) { return { partNumber: r.partNumber, etag: r.etag }; }),
+      });
+    } catch (err) {
+      fetch("/api/uploads/" + start.id, { method: "DELETE", credentials: "same-origin" }).catch(function () {});
+      throw err;
+    }
+  }
+
+  async function uploadFiles(files) {
     hide(errorPanel);
+    if (maxFileBytes > 0) {
+      for (var j = 0; j < files.length; j++) {
+        if (files[j].size > maxFileBytes) {
+          fileInput.value = "";
+          showError("“" + files[j].name + "” is too large. Max " + formatSize(maxFileBytes) + ".");
+          return;
+        }
+      }
+    }
     show(progressPanel);
 
     var label = files.length === 1 ? files[0].name : files.length + " files";
@@ -940,44 +1057,30 @@
     progressBar.style.width = "0%";
     progressPct.textContent = "0%";
 
-    var form = new FormData();
-    for (var i = 0; i < files.length; i++) form.append("file", files[i]);
-
-    var xhr = new XMLHttpRequest();
-    xhr.open("POST", withContainer("/api/upload"));
-
-    xhr.upload.addEventListener("progress", function (e) {
-      if (!e.lengthComputable) return;
-      var pct = Math.round((e.loaded / e.total) * 100);
+    var total = 0;
+    for (var i = 0; i < files.length; i++) total += files[i].size;
+    var done = 0;
+    function setPct(current) {
+      var pct = total > 0 ? Math.min(100, Math.round(((done + current) / total) * 100)) : 100;
       progressBar.style.width = pct + "%";
       progressPct.textContent = pct + "%";
-    });
+    }
 
-    xhr.addEventListener("load", function () {
-      hide(progressPanel);
-      fileInput.value = "";
-      var data;
-      try {
-        data = JSON.parse(xhr.responseText);
-      } catch (e) {
-        showError("Unexpected server response.");
-        return;
-      }
-
-      if (xhr.status >= 200 && xhr.status < 300) {
+    try {
+      for (var f = 0; f < files.length; f++) {
+        if (files.length > 1) progressName.textContent = files[f].name + " (" + (f + 1) + "/" + files.length + ")";
+        await uploadOne(files[f], setPct);
+        done += files[f].size;
+        setPct(0);
         loadFiles({ forceError: true });
-      } else {
-        showError((data && data.error) || "Upload failed.");
       }
-    });
-
-    xhr.addEventListener("error", function () {
+    } catch (err) {
+      showError((err && err.message) || "Upload failed.");
+    } finally {
       hide(progressPanel);
       fileInput.value = "";
-      showError("Network error. Check your connection and try again.");
-    });
-
-    xhr.send(form);
+      loadFiles({ forceError: true });
+    }
   }
 
   function renderContainers(list, active) {

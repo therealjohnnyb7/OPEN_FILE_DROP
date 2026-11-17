@@ -8,3 +8,5 @@ uploads/
 *.log
 npm-debug.log*
 .railway/
+.wrangler/
+.dev.vars
